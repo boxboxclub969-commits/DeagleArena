@@ -16,13 +16,16 @@ local Config = {
 	},
 	AimHoldInput = Enum.UserInputType.MouseButton2, -- khusus PC, tahan untuk aim
 	AimPart = "Head",
-	AimFovPixels = 250,
-	AimSmoothing = 0.25, -- 0..1, makin kecil makin halus
+	AimFovPixels = 300,
+	AimSmoothing = 0.35, -- 0..1, makin kecil makin halus
 	TeamCheck = true,
-	WallCheck = true,
+	WallCheck = false, -- true bisa bikin Aim gagal kalau ada part tak terlihat di jalur
 	ESPMaxDistance = 2000,
 	FlySpeed = 60,
 	WalkSpeed = 40,
+	ScanNonPlayers = true, -- cari model ber-Humanoid di luar daftar Players
+	ScanInterval = 2, -- detik antar scan Workspace
+	MaxScanTargets = 64,
 	Colors = {
 		On = Color3.fromRGB(46, 160, 90),
 		Off = Color3.fromRGB(45, 45, 55),
@@ -39,7 +42,12 @@ local espObjects = {}
 local buttons = {}
 local savedWalkSpeed = nil
 local unloaded = false
-local gui, flyPad
+local gui, flyPad, statusLabel
+
+local scanModels = {}
+local scanAt = -math.huge
+local targetCounts = { players = 0, scanned = 0 }
+local lastLock = "none"
 
 local AIM_BIND_NAME = "DeagleArenaAim"
 
@@ -68,38 +76,113 @@ local function refreshButton(name)
 	button.BackgroundColor3 = on and Config.Colors.On or Config.Colors.Off
 end
 
+-- Target discovery
+local function pickRoot(model)
+	return model:FindFirstChild("HumanoidRootPart")
+		or model.PrimaryPart
+		or model:FindFirstChild("Head")
+		or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function describeModel(model, player)
+	local root = pickRoot(model)
+	if not root then return nil end
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.Health <= 0 then return nil end
+	return {
+		model = model,
+		player = player,
+		humanoid = humanoid,
+		root = root,
+		head = model:FindFirstChild("Head") or root,
+		name = player and player.Name or model.Name,
+	}
+end
+
+local function getTargets()
+	local list, seen = {}, {}
+	local playerCount = 0
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		if player ~= LocalPlayer and character then
+			seen[character] = true
+			if isEnemy(player) then
+				local target = describeModel(character, player)
+				if target then
+					table.insert(list, target)
+					playerCount += 1
+				end
+			end
+		end
+	end
+
+	local scannedCount = 0
+	if Config.ScanNonPlayers then
+		local now = os.clock()
+		if now - scanAt >= Config.ScanInterval then
+			scanAt = now
+			local found = {}
+			for _, descendant in ipairs(Workspace:GetDescendants()) do
+				if descendant:IsA("Humanoid") then
+					local model = descendant.Parent
+					if model and model:IsA("Model") then table.insert(found, model) end
+				end
+			end
+			scanModels = found
+		end
+
+		local myCharacter = LocalPlayer.Character
+		for _, model in ipairs(scanModels) do
+			if scannedCount >= Config.MaxScanTargets then break end
+			if model.Parent
+				and model ~= myCharacter
+				and not seen[model]
+				and not (myCharacter and model:IsDescendantOf(myCharacter)) then
+				seen[model] = true
+				local target = describeModel(model, nil)
+				if target then
+					table.insert(list, target)
+					scannedCount += 1
+				end
+			end
+		end
+	end
+
+	targetCounts.players, targetCounts.scanned = playerCount, scannedCount
+	return list
+end
+
 -- ESP
-local function destroyESP(player)
-	local entry = espObjects[player]
+local function destroyESP(model)
+	local entry = espObjects[model]
 	if not entry then return end
 	if entry.highlight then entry.highlight:Destroy() end
 	if entry.billboard then entry.billboard:Destroy() end
-	espObjects[player] = nil
+	espObjects[model] = nil
 end
 
-local function ensureESP(player, character)
-	local entry = espObjects[player]
-	if entry and entry.character == character and entry.highlight.Parent then
+local function ensureESP(target)
+	local model = target.model
+	local entry = espObjects[model]
+	if entry and entry.highlight.Parent and entry.billboard.Parent then
 		return entry
 	end
-	destroyESP(player)
-
-	local head = character:FindFirstChild("Head")
-	if not head then return nil end
+	destroyESP(model)
 
 	local highlight = Instance.new("Highlight")
 	highlight.FillColor = Color3.fromRGB(255, 60, 90)
 	highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
 	highlight.FillTransparency = 0.6
 	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	highlight.Parent = character
+	highlight.Parent = model
 
 	local billboard = Instance.new("BillboardGui")
 	billboard.Size = UDim2.fromOffset(160, 36)
 	billboard.StudsOffset = Vector3.new(0, 2.5, 0)
 	billboard.AlwaysOnTop = true
-	billboard.Adornee = head
-	billboard.Parent = head
+	billboard.Adornee = target.head
+	billboard.Parent = target.head
 
 	local label = Instance.new("TextLabel")
 	label.Size = UDim2.fromScale(1, 1)
@@ -110,79 +193,79 @@ local function ensureESP(player, character)
 	label.Font = Enum.Font.GothamBold
 	label.Parent = billboard
 
-	entry = { character = character, highlight = highlight, billboard = billboard, label = label }
-	espObjects[player] = entry
+	entry = { highlight = highlight, billboard = billboard, label = label }
+	espObjects[model] = entry
 	return entry
 end
 
 local function updateESP()
-	local _, _, myRoot = getCharacterParts(LocalPlayer)
-	for _, player in ipairs(Players:GetPlayers()) do
-		if not State.ESP or not isEnemy(player) then
-			destroyESP(player)
-		else
-			local character, humanoid, root = getCharacterParts(player)
-			if not character then
-				destroyESP(player)
-			else
-				local distance = myRoot and (myRoot.Position - root.Position).Magnitude or 0
-				if distance > Config.ESPMaxDistance then
-					destroyESP(player)
-				else
-					local entry = ensureESP(player, character)
-					if entry then
-						entry.label.Text = string.format(
-							"%s [%dm] HP %d",
-							player.Name,
-							math.floor(distance),
-							math.floor(humanoid.Health)
-						)
-					end
+	local active = {}
+	if State.ESP then
+		local myRoot = select(3, getCharacterParts(LocalPlayer))
+		for _, target in ipairs(getTargets()) do
+			local distance = myRoot and (myRoot.Position - target.root.Position).Magnitude or 0
+			if distance <= Config.ESPMaxDistance then
+				local entry = ensureESP(target)
+				if entry then
+					active[target.model] = true
+					local hp = target.humanoid and math.floor(target.humanoid.Health) or 0
+					entry.label.Text = string.format("%s [%dm] HP %d", target.name, math.floor(distance), hp)
 				end
 			end
 		end
 	end
+	for model in pairs(espObjects) do
+		if not active[model] then destroyESP(model) end
+	end
 end
 
 -- Aimbot
-local function isVisible(origin, part, character)
+local function isVisible(origin, part, model)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = { LocalPlayer.Character }
 	local result = Workspace:Raycast(origin, part.Position - origin, params)
-	return result == nil or result.Instance:IsDescendantOf(character)
+	return result == nil or result.Instance:IsDescendantOf(model)
 end
 
 local function getAimTarget()
 	local camera = Workspace.CurrentCamera
 	if not camera then return nil end
 	local center = camera.ViewportSize / 2
-	local bestPart, bestDistance = nil, Config.AimFovPixels
+	local bestPart, bestName, bestDistance = nil, nil, Config.AimFovPixels
 
-	for _, player in ipairs(Players:GetPlayers()) do
-		if isEnemy(player) then
-			local character = getCharacterParts(player)
-			local part = character and character:FindFirstChild(Config.AimPart)
-			if part then
-				local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
-				if onScreen then
-					local d = (Vector2.new(screenPoint.X, screenPoint.Y) - center).Magnitude
-					if d < bestDistance and (not Config.WallCheck or isVisible(camera.CFrame.Position, part, character)) then
-						bestPart, bestDistance = part, d
-					end
+	for _, target in ipairs(getTargets()) do
+		local part = target.model:FindFirstChild(Config.AimPart) or target.head
+		if part then
+			local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
+			if onScreen then
+				local d = (Vector2.new(screenPoint.X, screenPoint.Y) - center).Magnitude
+				if d < bestDistance
+					and (not Config.WallCheck or isVisible(camera.CFrame.Position, part, target.model)) then
+					bestPart, bestName, bestDistance = part, target.name, d
 				end
 			end
 		end
 	end
-	return bestPart
+	return bestPart, bestName
 end
 
 local function updateAim()
-	if not (State.Aim or Hold.Aim) then return end
-	if not getCharacterParts(LocalPlayer) then return end
+	if not (State.Aim or Hold.Aim) then
+		lastLock = "off"
+		return
+	end
+	if not getCharacterParts(LocalPlayer) then
+		lastLock = "dead"
+		return
+	end
 	local camera = Workspace.CurrentCamera
-	local target = getAimTarget()
-	if not camera or not target then return end
+	local target, name = getAimTarget()
+	if not camera or not target then
+		lastLock = "none"
+		return
+	end
+	lastLock = name
 	local goal = CFrame.lookAt(camera.CFrame.Position, target.Position)
 	camera.CFrame = camera.CFrame:Lerp(goal, Config.AimSmoothing)
 end
@@ -203,7 +286,6 @@ local function updateFly()
 	local camera = Workspace.CurrentCamera
 	if not humanoid or not root or not camera then return end
 
-	-- Arah horizontal dari joystick/WASD bawaan Roblox, kemiringan dari arah kamera.
 	local direction = Vector3.zero
 	local move = humanoid.MoveDirection
 	if move.Magnitude > 0 then
@@ -261,7 +343,7 @@ local function unload()
 	setFly(false)
 	updateSpeed()
 	pcall(function() RunService:UnbindFromRenderStep(AIM_BIND_NAME) end)
-	for player in pairs(espObjects) do destroyESP(player) end
+	for model in pairs(espObjects) do destroyESP(model) end
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	table.clear(connections)
 	if gui then gui:Destroy() end
@@ -304,7 +386,7 @@ local function buildGui()
 	local panel = Instance.new("Frame")
 	panel.Name = "Panel"
 	panel.Position = UDim2.new(0, 12, 0.3, 0)
-	panel.Size = UDim2.fromOffset(150, 40)
+	panel.Size = UDim2.fromOffset(170, 40)
 	panel.AutomaticSize = Enum.AutomaticSize.Y
 	panel.BackgroundColor3 = Config.Colors.Panel
 	panel.BackgroundTransparency = 0.15
@@ -363,6 +445,17 @@ local function buildGui()
 		button.Activated:Connect(function() toggle(name) end)
 	end
 
+	statusLabel = Instance.new("TextLabel")
+	statusLabel.LayoutOrder = 9
+	statusLabel.Size = UDim2.new(1, 0, 0, 34)
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+	statusLabel.Font = Enum.Font.Gotham
+	statusLabel.TextSize = 12
+	statusLabel.TextWrapped = true
+	statusLabel.Text = "Targets: -"
+	statusLabel.Parent = body
+
 	local unloadButton = Instance.new("TextButton")
 	unloadButton.LayoutOrder = 10
 	unloadButton.Size = UDim2.new(1, 0, 0, 34)
@@ -371,7 +464,6 @@ local function buildGui()
 	unloadButton.Parent = body
 	unloadButton.Activated:Connect(unload)
 
-	-- Tombol naik/turun untuk terbang, tahan untuk bergerak vertikal.
 	flyPad = Instance.new("Frame")
 	flyPad.Name = "FlyPad"
 	flyPad.AnchorPoint = Vector2.new(1, 1)
@@ -386,7 +478,6 @@ local function buildGui()
 		button.Position = UDim2.fromScale(0, yScale)
 		button.Size = UDim2.new(1, 0, 0.48, 0)
 		button.Text = text
-		button.TextSize = 26
 		styleButton(button, Config.Colors.Panel)
 		button.TextSize = 26
 		button.BackgroundTransparency = 0.2
@@ -409,8 +500,7 @@ local function buildGui()
 
 	if not attachGui(gui) then
 		gui:Destroy()
-		gui = nil
-		flyPad = nil
+		gui, flyPad, statusLabel = nil, nil, nil
 		warn("[DeagleArena] panel gagal dipasang ke GUI manapun, hotkey keyboard tetap aktif")
 	end
 end
@@ -443,17 +533,29 @@ end))
 
 RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, updateAim)
 
+local lastStatusAt = 0
 table.insert(connections, RunService.Heartbeat:Connect(function()
 	updateESP()
 	updateFly()
 	if State.Speed then updateSpeed() end
+
+	local now = os.clock()
+	if statusLabel and now - lastStatusAt >= 0.5 then
+		lastStatusAt = now
+		if not State.ESP then getTargets() end
+		statusLabel.Text = string.format(
+			"Targets: %d (P%d S%d)\nLock: %s",
+			targetCounts.players + targetCounts.scanned,
+			targetCounts.players,
+			targetCounts.scanned,
+			lastLock
+		)
+	end
 end))
 
 table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
 	savedWalkSpeed = nil
 	if State.Fly then task.defer(setFly, true) end
 end))
-
-table.insert(connections, Players.PlayerRemoving:Connect(destroyESP))
 
 buildGui()
