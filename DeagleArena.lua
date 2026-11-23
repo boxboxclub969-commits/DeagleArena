@@ -14,7 +14,7 @@ end
 local Config = {
 	Title = "Sloth",
 	LogoAssetId = nil, -- unset: isi angka asset Roblox kalau punya
-	LogoUrl = "https://raw.githubusercontent.com/boxboxclub969-commits/DeagleArena/main/sloth.jpg",
+		LogoUrl = "https://raw.githubusercontent.com/boxboxclub969-commits/DeagleArena/main/5ff1bacfd51a235527c4eead1fa70e39.jpg",
 	LogoFile = "sloth_logo.jpg",
 	LogoFallbackText = "💀",
 	Keys = {
