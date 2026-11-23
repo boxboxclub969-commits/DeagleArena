@@ -5,10 +5,20 @@ local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
+local env = (getgenv and getgenv()) or _G
+if type(env.SlothUnload) == "function" then
+	pcall(env.SlothUnload)
+end
+
 -- Semua angka di sini belum dikalibrasi, itu nilai awal.
 local Config = {
+	Title = "Sloth",
+	LogoAssetId = nil, -- unset: isi angka asset Roblox kalau punya
+	LogoUrl = "https://raw.githubusercontent.com/boxboxclub969-commits/DeagleArena/main/sloth.jpg",
+	LogoFile = "sloth_logo.jpg",
+	LogoFallbackText = "💀",
 	Keys = {
-		ESP = Enum.KeyCode.E,
+		Menu = Enum.KeyCode.RightShift,
 		Aim = Enum.KeyCode.Q,
 		Fly = Enum.KeyCode.F,
 		Speed = Enum.KeyCode.G,
@@ -16,7 +26,10 @@ local Config = {
 	},
 	AimHoldInput = Enum.UserInputType.MouseButton2, -- khusus PC, tahan untuk aim
 	AimPart = "Head",
-	AimFovPixels = 300,
+	AimFovPixels = 250, -- radius lingkaran aim
+	AimFovMin = 60,
+	AimFovMax = 600,
+	AimFovStep = 25,
 	AimSmoothing = 0.35, -- 0..1, makin kecil makin halus
 	TeamCheck = true,
 	WallCheck = false, -- true bisa bikin Aim gagal kalau ada part tak terlihat di jalur
@@ -29,27 +42,66 @@ local Config = {
 	Colors = {
 		On = Color3.fromRGB(46, 160, 90),
 		Off = Color3.fromRGB(45, 45, 55),
-		Panel = Color3.fromRGB(20, 20, 26),
+		Panel = Color3.fromRGB(14, 14, 20),
 		Danger = Color3.fromRGB(190, 55, 70),
+		Accent = Color3.fromRGB(70, 130, 220),
+		Box = Color3.fromRGB(255, 80, 100),
+		Skeleton = Color3.fromRGB(255, 255, 255),
+		Circle = Color3.fromRGB(255, 255, 255),
+		Lock = Color3.fromRGB(80, 255, 120),
 	},
 }
 
-local State = { ESP = false, Aim = false, Fly = false, Speed = false }
+local State = {
+	Aim = false,
+	Circle = true,
+	ESPName = false,
+	ESPBox = false,
+	ESPSkeleton = false,
+	Fly = false,
+	Speed = false,
+}
 local Hold = { Aim = false, FlyUp = false, FlyDown = false }
+local Labels = {
+	Aim = "Aim",
+	Circle = "Circle",
+	ESPName = "ESP Name",
+	ESPBox = "ESP Box",
+	ESPSkeleton = "ESP Skeleton",
+	Fly = "Fly",
+	Speed = "Speed",
+}
+
+local R15_PAIRS = {
+	{ "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
+	{ "UpperTorso", "LeftUpperArm" }, { "LeftUpperArm", "LeftLowerArm" }, { "LeftLowerArm", "LeftHand" },
+	{ "UpperTorso", "RightUpperArm" }, { "RightUpperArm", "RightLowerArm" }, { "RightLowerArm", "RightHand" },
+	{ "LowerTorso", "LeftUpperLeg" }, { "LeftUpperLeg", "LeftLowerLeg" }, { "LeftLowerLeg", "LeftFoot" },
+	{ "LowerTorso", "RightUpperLeg" }, { "RightUpperLeg", "RightLowerLeg" }, { "RightLowerLeg", "RightFoot" },
+}
+local R6_PAIRS = {
+	{ "Head", "Torso" }, { "Torso", "Left Arm" }, { "Torso", "Right Arm" },
+	{ "Torso", "Left Leg" }, { "Torso", "Right Leg" },
+}
+local MAX_LINES = 14
 
 local connections = {}
-local espObjects = {}
+local espEntries = {}
 local buttons = {}
 local savedWalkSpeed = nil
 local unloaded = false
-local gui, flyPad, statusLabel
+local aimRadius = Config.AimFovPixels
+
+local gui, overlay, flyPad, statusLabel, fovLabel, panelFrame
+local circleFrame, circleStroke
 
 local scanModels = {}
 local scanAt = -math.huge
 local targetCounts = { players = 0, scanned = 0 }
-local lastLock = "none"
+local lastLock = "off"
 
-local AIM_BIND_NAME = "DeagleArenaAim"
+local AIM_BIND_NAME = "SlothAim"
+local ESP_BIND_NAME = "SlothESP"
 
 local function getCharacterParts(player)
 	local character = player.Character
@@ -68,11 +120,11 @@ local function isEnemy(player)
 	return true
 end
 
-local function refreshButton(name)
-	local button = buttons[name]
+local function refreshButton(key)
+	local button = buttons[key]
 	if not button then return end
-	local on = State[name]
-	button.Text = string.format("%s: %s", name, on and "ON" or "OFF")
+	local on = State[key]
+	button.Text = string.format("%s: %s", Labels[key], on and "ON" or "OFF")
 	button.BackgroundColor3 = on and Config.Colors.On or Config.Colors.Off
 end
 
@@ -153,73 +205,154 @@ local function getTargets()
 	return list
 end
 
--- ESP
-local function destroyESP(model)
-	local entry = espObjects[model]
-	if not entry then return end
-	if entry.highlight then entry.highlight:Destroy() end
-	if entry.billboard then entry.billboard:Destroy() end
-	espObjects[model] = nil
+-- ESP (Name, Box, Skeleton) digambar dengan elemen GUI, tanpa Drawing API
+local function setLine(frame, a, b)
+	local delta = b - a
+	frame.Size = UDim2.fromOffset(delta.Magnitude, 1.5)
+	frame.Position = UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2)
+	frame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+	frame.Visible = true
 end
 
-local function ensureESP(target)
-	local model = target.model
-	local entry = espObjects[model]
-	if entry and entry.highlight.Parent and entry.billboard.Parent then
-		return entry
-	end
-	destroyESP(model)
+local function createEntry()
+	local entry = { lines = {} }
 
-	local highlight = Instance.new("Highlight")
-	highlight.FillColor = Color3.fromRGB(255, 60, 90)
-	highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-	highlight.FillTransparency = 0.6
-	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	highlight.Parent = model
-
-	local billboard = Instance.new("BillboardGui")
-	billboard.Size = UDim2.fromOffset(160, 36)
-	billboard.StudsOffset = Vector3.new(0, 2.5, 0)
-	billboard.AlwaysOnTop = true
-	billboard.Adornee = target.head
-	billboard.Parent = target.head
+	local box = Instance.new("Frame")
+	box.BackgroundTransparency = 1
+	box.BorderSizePixel = 0
+	box.Visible = false
+	box.Parent = overlay
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 1.5
+	stroke.Color = Config.Colors.Box
+	stroke.Parent = box
+	entry.box = box
 
 	local label = Instance.new("TextLabel")
-	label.Size = UDim2.fromScale(1, 1)
+	label.AnchorPoint = Vector2.new(0.5, 1)
+	label.Size = UDim2.fromOffset(160, 16)
 	label.BackgroundTransparency = 1
 	label.TextColor3 = Color3.new(1, 1, 1)
 	label.TextStrokeTransparency = 0
-	label.TextSize = 14
+	label.TextSize = 13
 	label.Font = Enum.Font.GothamBold
-	label.Parent = billboard
+	label.Visible = false
+	label.Parent = overlay
+	entry.label = label
 
-	entry = { highlight = highlight, billboard = billboard, label = label }
-	espObjects[model] = entry
+	for i = 1, MAX_LINES do
+		local line = Instance.new("Frame")
+		line.AnchorPoint = Vector2.new(0.5, 0.5)
+		line.BorderSizePixel = 0
+		line.BackgroundColor3 = Config.Colors.Skeleton
+		line.Visible = false
+		line.Parent = overlay
+		entry.lines[i] = line
+	end
 	return entry
 end
 
-local function updateESP()
-	local active = {}
-	if State.ESP then
-		local myRoot = select(3, getCharacterParts(LocalPlayer))
-		for _, target in ipairs(getTargets()) do
-			local distance = myRoot and (myRoot.Position - target.root.Position).Magnitude or 0
-			if distance <= Config.ESPMaxDistance then
-				local entry = ensureESP(target)
-				if entry then
-					active[target.model] = true
-					local hp = target.humanoid and math.floor(target.humanoid.Health) or 0
-					entry.label.Text = string.format("%s [%dm] HP %d", target.name, math.floor(distance), hp)
+local function destroyEntry(entry)
+	entry.box:Destroy()
+	entry.label:Destroy()
+	for _, line in ipairs(entry.lines) do line:Destroy() end
+end
+
+local function hideLinesFrom(entry, first)
+	for i = first, MAX_LINES do entry.lines[i].Visible = false end
+end
+
+local function drawSkeleton(entry, model, camera)
+	local pairsList
+	if model:FindFirstChild("UpperTorso") then
+		pairsList = R15_PAIRS
+	elseif model:FindFirstChild("Torso") then
+		pairsList = R6_PAIRS
+	end
+
+	local used = 0
+	if pairsList then
+		for _, pair in ipairs(pairsList) do
+			local a = model:FindFirstChild(pair[1])
+			local b = model:FindFirstChild(pair[2])
+			if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+				local pa = camera:WorldToViewportPoint(a.Position)
+				local pb = camera:WorldToViewportPoint(b.Position)
+				if pa.Z > 0 and pb.Z > 0 then
+					used += 1
+					setLine(entry.lines[used], Vector2.new(pa.X, pa.Y), Vector2.new(pb.X, pb.Y))
 				end
 			end
 		end
 	end
-	for model in pairs(espObjects) do
-		if not active[model] then destroyESP(model) end
+	hideLinesFrom(entry, used + 1)
+end
+
+local function updateESP()
+	local camera = Workspace.CurrentCamera
+	local wantAny = State.ESPName or State.ESPBox or State.ESPSkeleton
+	local seen = {}
+
+	if wantAny and camera and overlay then
+		local myRoot = select(3, getCharacterParts(LocalPlayer))
+		local origin = myRoot and myRoot.Position or camera.CFrame.Position
+
+		for _, target in ipairs(getTargets()) do
+			local model = target.model
+			local okBox, cf, size = pcall(function()
+				local boxCf, boxSize = model:GetBoundingBox()
+				return boxCf, boxSize
+			end)
+			if okBox then
+				local top = camera:WorldToViewportPoint(cf.Position + Vector3.new(0, size.Y / 2, 0))
+				local bottom = camera:WorldToViewportPoint(cf.Position - Vector3.new(0, size.Y / 2, 0))
+				local distance = (origin - cf.Position).Magnitude
+				local height = math.abs(bottom.Y - top.Y)
+
+				if distance <= Config.ESPMaxDistance
+					and top.Z > 0 and bottom.Z > 0
+					and height == height and height > 2 and height < 4000 then
+					local entry = espEntries[model]
+					if not entry then
+						entry = createEntry()
+						espEntries[model] = entry
+					end
+					seen[model] = true
+
+					local width = height * 0.55
+					local centerX = (top.X + bottom.X) / 2
+					local topY = math.min(top.Y, bottom.Y)
+
+					entry.box.Visible = State.ESPBox
+					entry.box.Position = UDim2.fromOffset(centerX - width / 2, topY)
+					entry.box.Size = UDim2.fromOffset(width, height)
+
+					entry.label.Visible = State.ESPName
+					if State.ESPName then
+						local hp = target.humanoid and math.floor(target.humanoid.Health) or 0
+						entry.label.Position = UDim2.fromOffset(centerX, topY - 2)
+						entry.label.Text = string.format("%s [%dm] HP %d", target.name, math.floor(distance), hp)
+					end
+
+					if State.ESPSkeleton then
+						drawSkeleton(entry, model, camera)
+					else
+						hideLinesFrom(entry, 1)
+					end
+				end
+			end
+		end
+	end
+
+	for model, entry in pairs(espEntries) do
+		if not seen[model] then
+			destroyEntry(entry)
+			espEntries[model] = nil
+		end
 	end
 end
 
--- Aimbot
+-- Aimbot dengan lingkaran
 local function isVisible(origin, part, model)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -232,14 +365,14 @@ local function getAimTarget()
 	local camera = Workspace.CurrentCamera
 	if not camera then return nil end
 	local center = camera.ViewportSize / 2
-	local bestPart, bestName, bestDistance = nil, nil, Config.AimFovPixels
+	local bestPart, bestName, bestDistance = nil, nil, aimRadius
 
 	for _, target in ipairs(getTargets()) do
 		local part = target.model:FindFirstChild(Config.AimPart) or target.head
 		if part then
-			local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
+			local point, onScreen = camera:WorldToViewportPoint(part.Position)
 			if onScreen then
-				local d = (Vector2.new(screenPoint.X, screenPoint.Y) - center).Magnitude
+				local d = (Vector2.new(point.X, point.Y) - center).Magnitude
 				if d < bestDistance
 					and (not Config.WallCheck or isVisible(camera.CFrame.Position, part, target.model)) then
 					bestPart, bestName, bestDistance = part, target.name, d
@@ -250,24 +383,36 @@ local function getAimTarget()
 	return bestPart, bestName
 end
 
+local function updateCircle(locked)
+	if not circleFrame then return end
+	local show = State.Circle and (State.Aim or Hold.Aim)
+	circleFrame.Visible = show
+	if show then
+		circleFrame.Size = UDim2.fromOffset(aimRadius * 2, aimRadius * 2)
+		circleStroke.Color = locked and Config.Colors.Lock or Config.Colors.Circle
+	end
+end
+
 local function updateAim()
-	if not (State.Aim or Hold.Aim) then
-		lastLock = "off"
-		return
+	local active = State.Aim or Hold.Aim
+	local locked = false
+
+	if active and getCharacterParts(LocalPlayer) then
+		local camera = Workspace.CurrentCamera
+		local part, name = getAimTarget()
+		if camera and part then
+			locked = true
+			lastLock = name
+			local goal = CFrame.lookAt(camera.CFrame.Position, part.Position)
+			camera.CFrame = camera.CFrame:Lerp(goal, Config.AimSmoothing)
+		else
+			lastLock = "none"
+		end
+	else
+		lastLock = active and "dead" or "off"
 	end
-	if not getCharacterParts(LocalPlayer) then
-		lastLock = "dead"
-		return
-	end
-	local camera = Workspace.CurrentCamera
-	local target, name = getAimTarget()
-	if not camera or not target then
-		lastLock = "none"
-		return
-	end
-	lastLock = name
-	local goal = CFrame.lookAt(camera.CFrame.Position, target.Position)
-	camera.CFrame = camera.CFrame:Lerp(goal, Config.AimSmoothing)
+
+	updateCircle(locked)
 end
 
 -- Fly dan Speed
@@ -322,16 +467,16 @@ local function updateSpeed()
 	end
 end
 
-local function toggle(name)
-	if name == "Fly" then
+local function toggle(key)
+	if key == "Fly" then
 		setFly(not State.Fly)
-	elseif name == "Speed" then
+	elseif key == "Speed" then
 		State.Speed = not State.Speed
 		updateSpeed()
 		refreshButton("Speed")
 	else
-		State[name] = not State[name]
-		refreshButton(name)
+		State[key] = not State[key]
+		refreshButton(key)
 	end
 end
 
@@ -339,14 +484,21 @@ end
 local function unload()
 	if unloaded then return end
 	unloaded = true
-	State.ESP, State.Aim, State.Speed = false, false, false
+	State.Aim, State.Speed = false, false
+	State.ESPName, State.ESPBox, State.ESPSkeleton = false, false, false
 	setFly(false)
 	updateSpeed()
 	pcall(function() RunService:UnbindFromRenderStep(AIM_BIND_NAME) end)
-	for model in pairs(espObjects) do destroyESP(model) end
+	pcall(function() RunService:UnbindFromRenderStep(ESP_BIND_NAME) end)
+	for model, entry in pairs(espEntries) do
+		destroyEntry(entry)
+		espEntries[model] = nil
+	end
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	table.clear(connections)
 	if gui then gui:Destroy() end
+	if overlay then overlay:Destroy() end
+	if env.SlothUnload == unload then env.SlothUnload = nil end
 end
 
 -- GUI
@@ -369,99 +521,304 @@ local function styleButton(button, color)
 	button.BackgroundColor3 = color
 	button.TextColor3 = Color3.new(1, 1, 1)
 	button.Font = Enum.Font.GothamBold
-	button.TextSize = 16
+	button.TextSize = 15
 	button.AutoButtonColor = true
 	local corner = Instance.new("UICorner")
 	corner.CornerRadius = UDim.new(0, 8)
 	corner.Parent = button
 end
 
-local function buildGui()
+local function buildOverlay()
+	overlay = Instance.new("ScreenGui")
+	overlay.Name = "SlothOverlay"
+	overlay.ResetOnSpawn = false
+	overlay.IgnoreGuiInset = true
+	overlay.DisplayOrder = 998
+
+	circleFrame = Instance.new("Frame")
+	circleFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+	circleFrame.Position = UDim2.fromScale(0.5, 0.5)
+	circleFrame.BackgroundTransparency = 1
+	circleFrame.BorderSizePixel = 0
+	circleFrame.Visible = false
+	circleFrame.Parent = overlay
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = circleFrame
+	circleStroke = Instance.new("UIStroke")
+	circleStroke.Thickness = 2
+	circleStroke.Color = Config.Colors.Circle
+	circleStroke.Parent = circleFrame
+
+	if not attachGui(overlay) then
+		overlay:Destroy()
+		overlay, circleFrame, circleStroke = nil, nil, nil
+		warn("[Sloth] overlay gagal dipasang, ESP dan lingkaran tidak tampil")
+	end
+end
+
+local function applyLogo(logo, fallback)
+	if Config.LogoAssetId then
+		logo.Image = "rbxassetid://" .. tostring(Config.LogoAssetId)
+		fallback.Visible = false
+		return
+	end
+	if Config.LogoUrl and writefile and getcustomasset then
+		task.spawn(function()
+			local ok, asset = pcall(function()
+				local data = game:HttpGet(Config.LogoUrl)
+				local isJpg = data:sub(1, 2) == "\255\216"
+				local isPng = data:sub(2, 4) == "PNG"
+				if #data < 200 or not (isJpg or isPng) then return nil end
+				writefile(Config.LogoFile, data)
+				return getcustomasset(Config.LogoFile)
+			end)
+			if ok and asset and not unloaded then
+				logo.Image = asset
+				fallback.Visible = false
+			end
+		end)
+	end
+end
+
+local function makeDraggable(handle, target, onTap)
+	local dragging, moved = false, false
+	local tracked, startPointer, startPosition
+
+	table.insert(connections, handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch
+			or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging, moved = true, false
+			tracked = input
+			startPointer = input.Position
+			startPosition = target.Position
+		end
+	end))
+
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if not dragging then return end
+		local isTracked = (input == tracked)
+			or (tracked.UserInputType == Enum.UserInputType.MouseButton1
+				and input.UserInputType == Enum.UserInputType.MouseMovement)
+		if not isTracked then return end
+		local delta = input.Position - startPointer
+		if delta.Magnitude > 6 then moved = true end
+		if moved then
+			target.Position = UDim2.new(
+				startPosition.X.Scale, startPosition.X.Offset + delta.X,
+				startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+			)
+		end
+	end))
+
+	table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+		if not dragging then return end
+		if input == tracked or (tracked.UserInputType == Enum.UserInputType.MouseButton1
+			and input.UserInputType == Enum.UserInputType.MouseButton1) then
+			dragging = false
+			if not moved then onTap() end
+		end
+	end))
+end
+
+local function buildMenu()
 	gui = Instance.new("ScreenGui")
-	gui.Name = "DeagleArenaPanel"
+	gui.Name = "Sloth"
 	gui.ResetOnSpawn = false
 	gui.IgnoreGuiInset = true
 	gui.DisplayOrder = 999
 
-	local panel = Instance.new("Frame")
-	panel.Name = "Panel"
-	panel.Position = UDim2.new(0, 12, 0.3, 0)
-	panel.Size = UDim2.fromOffset(170, 40)
-	panel.AutomaticSize = Enum.AutomaticSize.Y
-	panel.BackgroundColor3 = Config.Colors.Panel
-	panel.BackgroundTransparency = 0.15
-	panel.Parent = gui
+	local root = Instance.new("Frame")
+	root.Size = UDim2.fromOffset(56, 56)
+	root.Position = UDim2.new(0, 12, 0.4, 0)
+	root.BackgroundTransparency = 1
+	root.Parent = gui
+
+	local logo = Instance.new("ImageButton")
+	logo.Size = UDim2.fromOffset(56, 56)
+	logo.Rotation = 0
+	logo.BackgroundColor3 = Color3.fromRGB(8, 8, 12)
+	logo.AutoButtonColor = false
+	logo.ScaleType = Enum.ScaleType.Crop
+	logo.Image = ""
+	logo.Parent = root
 	do
 		local corner = Instance.new("UICorner")
 		corner.CornerRadius = UDim.new(0, 10)
-		corner.Parent = panel
-		local padding = Instance.new("UIPadding")
-		padding.PaddingTop = UDim.new(0, 6)
-		padding.PaddingBottom = UDim.new(0, 6)
-		padding.PaddingLeft = UDim.new(0, 6)
-		padding.PaddingRight = UDim.new(0, 6)
-		padding.Parent = panel
-		local layout = Instance.new("UIListLayout")
-		layout.Padding = UDim.new(0, 6)
-		layout.SortOrder = Enum.SortOrder.LayoutOrder
-		layout.Parent = panel
+		corner.Parent = logo
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 2
+		stroke.Color = Config.Colors.Accent
+		stroke.Parent = logo
 	end
 
-	local body = Instance.new("Frame")
-	body.Name = "Body"
-	body.LayoutOrder = 2
-	body.Size = UDim2.new(1, 0, 0, 0)
-	body.AutomaticSize = Enum.AutomaticSize.Y
-	body.BackgroundTransparency = 1
-	body.Parent = panel
+	local fallback = Instance.new("TextLabel")
+	fallback.Size = UDim2.fromScale(1, 1)
+	fallback.BackgroundTransparency = 1
+	fallback.Text = Config.LogoFallbackText
+	fallback.TextSize = 30
+	fallback.Active = false
+	fallback.Parent = logo
+	applyLogo(logo, fallback)
+
+	local viewportY = 400
+	pcall(function() viewportY = Workspace.CurrentCamera.ViewportSize.Y end)
+	local panelHeight = math.clamp(viewportY - 60, 180, 320)
+
+	panelFrame = Instance.new("Frame")
+	panelFrame.Position = UDim2.fromOffset(64, 0)
+	panelFrame.Size = UDim2.fromOffset(250, panelHeight)
+	panelFrame.BackgroundColor3 = Config.Colors.Panel
+	panelFrame.BackgroundTransparency = 0.08
+	panelFrame.Visible = false
+	panelFrame.Parent = root
+	do
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 12)
+		corner.Parent = panelFrame
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 1.5
+		stroke.Color = Config.Colors.Accent
+		stroke.Parent = panelFrame
+	end
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 34)
+	title.BackgroundTransparency = 1
+	title.Text = Config.Title
+	title.TextColor3 = Color3.new(1, 1, 1)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 18
+	title.Parent = panelFrame
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Position = UDim2.fromOffset(0, 34)
+	scroll.Size = UDim2.new(1, 0, 1, -34)
+	scroll.BackgroundTransparency = 1
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 4
+	scroll.CanvasSize = UDim2.new()
+	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	scroll.Parent = panelFrame
 	do
 		local layout = Instance.new("UIListLayout")
 		layout.Padding = UDim.new(0, 6)
 		layout.SortOrder = Enum.SortOrder.LayoutOrder
-		layout.Parent = body
+		layout.Parent = scroll
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 8)
+		padding.PaddingRight = UDim.new(0, 12)
+		padding.PaddingBottom = UDim.new(0, 8)
+		padding.Parent = scroll
 	end
 
-	local header = Instance.new("TextButton")
-	header.LayoutOrder = 1
-	header.Size = UDim2.new(1, 0, 0, 30)
-	header.Text = "Deagle Arena  [-]"
-	styleButton(header, Config.Colors.Off)
-	header.TextSize = 14
-	header.Parent = panel
-	header.Activated:Connect(function()
-		body.Visible = not body.Visible
-		header.Text = body.Visible and "Deagle Arena  [-]" or "Deagle Arena  [+]"
-	end)
+	local order = 0
+	local function nextOrder()
+		order += 1
+		return order
+	end
 
-	for index, name in ipairs({ "ESP", "Aim", "Fly", "Speed" }) do
+	local function addSection(text)
+		local label = Instance.new("TextLabel")
+		label.LayoutOrder = nextOrder()
+		label.Size = UDim2.new(1, 0, 0, 20)
+		label.BackgroundTransparency = 1
+		label.Text = text
+		label.TextColor3 = Config.Colors.Accent
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 13
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Parent = scroll
+	end
+
+	local function addToggle(key)
 		local button = Instance.new("TextButton")
-		button.Name = name
-		button.LayoutOrder = index
-		button.Size = UDim2.new(1, 0, 0, 40)
+		button.LayoutOrder = nextOrder()
+		button.Size = UDim2.new(1, 0, 0, 36)
 		styleButton(button, Config.Colors.Off)
-		button.Parent = body
-		buttons[name] = button
-		refreshButton(name)
-		button.Activated:Connect(function() toggle(name) end)
+		button.Parent = scroll
+		buttons[key] = button
+		refreshButton(key)
+		button.Activated:Connect(function() toggle(key) end)
 	end
+
+	local function addFovStepper()
+		local row = Instance.new("Frame")
+		row.LayoutOrder = nextOrder()
+		row.Size = UDim2.new(1, 0, 0, 36)
+		row.BackgroundTransparency = 1
+		row.Parent = scroll
+
+		local function refreshFov()
+			fovLabel.Text = "Circle size " .. tostring(aimRadius)
+		end
+
+		local minus = Instance.new("TextButton")
+		minus.Size = UDim2.new(0.25, -3, 1, 0)
+		minus.Text = "-"
+		styleButton(minus, Config.Colors.Off)
+		minus.TextSize = 20
+		minus.Parent = row
+
+		fovLabel = Instance.new("TextLabel")
+		fovLabel.Position = UDim2.fromScale(0.25, 0)
+		fovLabel.Size = UDim2.fromScale(0.5, 1)
+		fovLabel.BackgroundTransparency = 1
+		fovLabel.TextColor3 = Color3.new(1, 1, 1)
+		fovLabel.Font = Enum.Font.GothamBold
+		fovLabel.TextSize = 12
+		fovLabel.Parent = row
+
+		local plus = Instance.new("TextButton")
+		plus.Position = UDim2.new(0.75, 3, 0, 0)
+		plus.Size = UDim2.new(0.25, -3, 1, 0)
+		plus.Text = "+"
+		styleButton(plus, Config.Colors.Off)
+		plus.TextSize = 20
+		plus.Parent = row
+
+		minus.Activated:Connect(function()
+			aimRadius = math.clamp(aimRadius - Config.AimFovStep, Config.AimFovMin, Config.AimFovMax)
+			refreshFov()
+		end)
+		plus.Activated:Connect(function()
+			aimRadius = math.clamp(aimRadius + Config.AimFovStep, Config.AimFovMin, Config.AimFovMax)
+			refreshFov()
+		end)
+		refreshFov()
+	end
+
+	addSection("AIM")
+	addToggle("Aim")
+	addToggle("Circle")
+	addFovStepper()
+
+	addSection("ESP")
+	addToggle("ESPName")
+	addToggle("ESPBox")
+	addToggle("ESPSkeleton")
+
+	addSection("MOVE")
+	addToggle("Fly")
+	addToggle("Speed")
 
 	statusLabel = Instance.new("TextLabel")
-	statusLabel.LayoutOrder = 9
-	statusLabel.Size = UDim2.new(1, 0, 0, 34)
+	statusLabel.LayoutOrder = nextOrder()
+	statusLabel.Size = UDim2.new(1, 0, 0, 32)
 	statusLabel.BackgroundTransparency = 1
 	statusLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
 	statusLabel.Font = Enum.Font.Gotham
 	statusLabel.TextSize = 12
 	statusLabel.TextWrapped = true
 	statusLabel.Text = "Targets: -"
-	statusLabel.Parent = body
+	statusLabel.Parent = scroll
 
 	local unloadButton = Instance.new("TextButton")
-	unloadButton.LayoutOrder = 10
+	unloadButton.LayoutOrder = nextOrder()
 	unloadButton.Size = UDim2.new(1, 0, 0, 34)
 	unloadButton.Text = "Unload"
 	styleButton(unloadButton, Config.Colors.Danger)
-	unloadButton.Parent = body
+	unloadButton.Parent = scroll
 	unloadButton.Activated:Connect(unload)
 
 	flyPad = Instance.new("Frame")
@@ -498,10 +855,14 @@ local function buildGui()
 	makeHold("▲", 0, "FlyUp")
 	makeHold("▼", 0.52, "FlyDown")
 
+	makeDraggable(logo, root, function()
+		panelFrame.Visible = not panelFrame.Visible
+	end)
+
 	if not attachGui(gui) then
 		gui:Destroy()
-		gui, flyPad, statusLabel = nil, nil, nil
-		warn("[DeagleArena] panel gagal dipasang ke GUI manapun, hotkey keyboard tetap aktif")
+		gui, flyPad, statusLabel, panelFrame = nil, nil, nil, nil
+		warn("[Sloth] menu gagal dipasang ke GUI manapun, hotkey keyboard tetap aktif")
 	end
 end
 
@@ -510,8 +871,8 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, pr
 	if processed then return end
 	if input.UserInputType == Config.AimHoldInput then
 		Hold.Aim = true
-	elseif input.KeyCode == Config.Keys.ESP then
-		toggle("ESP")
+	elseif input.KeyCode == Config.Keys.Menu then
+		if panelFrame then panelFrame.Visible = not panelFrame.Visible end
 	elseif input.KeyCode == Config.Keys.Aim then
 		toggle("Aim")
 	elseif input.KeyCode == Config.Keys.Fly then
@@ -532,17 +893,17 @@ table.insert(connections, UserInputService.WindowFocusReleased:Connect(function(
 end))
 
 RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, updateAim)
+RunService:BindToRenderStep(ESP_BIND_NAME, Enum.RenderPriority.Camera.Value + 2, updateESP)
 
 local lastStatusAt = 0
 table.insert(connections, RunService.Heartbeat:Connect(function()
-	updateESP()
 	updateFly()
 	if State.Speed then updateSpeed() end
 
 	local now = os.clock()
 	if statusLabel and now - lastStatusAt >= 0.5 then
 		lastStatusAt = now
-		if not State.ESP then getTargets() end
+		getTargets()
 		statusLabel.Text = string.format(
 			"Targets: %d (P%d S%d)\nLock: %s",
 			targetCounts.players + targetCounts.scanned,
@@ -558,4 +919,6 @@ table.insert(connections, LocalPlayer.CharacterAdded:Connect(function()
 	if State.Fly then task.defer(setFly, true) end
 end))
 
-buildGui()
+env.SlothUnload = unload
+buildOverlay()
+buildMenu()
